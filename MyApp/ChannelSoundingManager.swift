@@ -261,7 +261,7 @@ extension ChannelSoundingManager: CBPeripheralDelegate {
                     didReceive results: CBChannelSoundingProcedureResults?,
                     error: Error?) {
         if let error {
-            sessionError = error.localizedDescription
+            sessionError = Self.channelSoundingErrorMessage(for: error)
             return
         }
         // The API reports a negative sentinel when no valid measurement is available.
@@ -278,6 +278,25 @@ extension ChannelSoundingManager: CBPeripheralDelegate {
         if case .ranging(let name) = connectionState {
             connectionState = .connected(name)
         }
-        if let error { sessionError = error.localizedDescription }
+        if let error { sessionError = Self.channelSoundingErrorMessage(for: error) }
+    }
+
+    /// Builds a readable message that includes the error code, plus recovery
+    /// hints for the Channel Sounding failures seen with nRF54L15 reflectors.
+    private static func channelSoundingErrorMessage(for error: Error) -> String {
+        let nsError = error as NSError
+        let base = "\(error.localizedDescription) (\(nsError.domain) \(nsError.code))"
+
+        guard nsError.domain == CBError.errorDomain else { return base }
+        switch nsError.code {
+        case 19:
+            // channelSoundingConfigurationFailed: often happens on the first attempt
+            // right after a fresh AccessorySetupKit pairing on iOS 27.
+            return base + "\nChannel Sounding configuration failed. Power-cycle the board, reconnect, and start ranging again."
+        case CBError.operationNotSupported.rawValue:
+            return base + "\nThe board connected but didn't accept Channel Sounding. Check that its firmware is a CS reflector with the Ranging Service (RAS) enabled."
+        default:
+            return base
+        }
     }
 }
