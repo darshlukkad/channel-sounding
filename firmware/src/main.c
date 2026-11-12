@@ -222,6 +222,15 @@ int main(void)
 		settings_load();
 	}
 
+	/* Hold Button 1 while resetting the board to erase all stored bonds. */
+	err = dk_buttons_init(NULL);
+	if (err) {
+		LOG_WRN("Buttons init failed (err %d)", err);
+	} else if (dk_get_buttons() & DK_BTN1_MSK) {
+		err = bt_unpair(BT_ID_DEFAULT, NULL);
+		LOG_INF("Button 1 held: cleared all bonds (err %d)", err);
+	}
+
 	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), NULL, 0);
 	if (err) {
 		LOG_ERR("Advertising failed to start (err %d)", err);
