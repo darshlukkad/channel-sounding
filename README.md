@@ -62,8 +62,8 @@ d = c · Δφ / (4π · Δf)
 
 where `c` is the speed of light, `Δf` is the frequency step, and `Δφ` is the
 change in round-trip phase over that step. CS uses up to **72 channels, 1 MHz
-apart** (2404–2478 MHz). With 1 MHz steps, the result is unambiguous up to
-`c / (2 · 1 MHz) ≈ 150 m`.
+apart** (2404–2478 MHz, skipping 2425–2427 MHz around advertising channel 38).
+With 1 MHz steps, the result is unambiguous up to `c / (2 · 1 MHz) ≈ 150 m`.
 
 Each radio's local oscillator adds an unknown phase offset. Because both sides
 measure and their results are combined, those unknown offsets cancel out. That's
@@ -110,6 +110,23 @@ Radio waves bounce off walls, floors, and people (**multipath**). The receiver
 then sees several copies of the signal that took different paths, which can
 shift a single reading by a metre or more. A hand or body between the devices
 also blocks the direct path. The app's filter is there to reduce these effects.
+
+The setup matters as much as the software:
+
+- **A table or floor between two devices at the same height** is the worst case.
+  The bounce off the surface is almost as long as the direct path and arrives
+  mixed with it, which usually makes the distance read **too long**. In testing,
+  holding the phone above the board gave clearly better readings than placing
+  both side by side on a desk.
+- **Antennas aren't equally sensitive in every direction.** The DK's single PCB
+  antenna and the iPhone's antennas both have weaker directions, so rotating
+  either device changes the reading.
+- **Every phone and board pair has a fixed offset** (for example, about +0.7 m
+  at 1 m before calibration). Calibrating removes it.
+
+The iOS API reports only a distance per procedure, with no quality value, and
+iOS chooses the CS parameters. So the app can filter and calibrate, but it can't
+tune the measurement itself.
 
 ---
 
@@ -254,10 +271,15 @@ I: CS procedures enabled:
 ### Requirements
 
 - An iPhone that supports Bluetooth Channel Sounding, running **iOS 27.2 or
-  later** (developed with an iPhone 17). The app checks
+  later** (developed with an iPhone 17 Pro). The app checks
   `CBCentralManager.supports(.channelSounding)` and shows an error otherwise.
-- Xcode with the iOS 27 SDK. Open `ios/channel-sounding.xcodeproj`, set your
-  signing team, and run on the device.
+  Channel Sounding doesn't work in Simulator.
+- Xcode with the iOS 27 SDK. Open `ios/channel-sounding.xcodeproj` (the target
+  and scheme are named `MyApp`), set your signing team and a unique bundle
+  identifier, and run on the device.
+- **Developer Mode** turned on on the iPhone (Settings › Privacy & Security ›
+  Developer Mode). With a free Apple ID, also trust the developer profile once
+  under Settings › General › VPN & Device Management before the first launch.
 
 ### How it works
 
@@ -285,24 +307,38 @@ I: CS procedures enabled:
 
 ### Distance processing (`RangeFilter`)
 
-Each reading goes through:
+Before filtering, `ChannelSoundingManager` subtracts the calibration offset (see
+below). `RangeFilter` then runs each reading through:
 
-1. **Calibration offset**: a fixed offset (see below) is subtracted.
-2. **Median of the last 7 readings**: removes single-reading spikes.
-3. **Jump gate**: if the median jumps more than **1 m** from the current estimate
+1. **Median of the last 7 readings**: removes single-reading spikes.
+2. **Jump gate**: if the median jumps more than **1 m** from the current estimate
    while RSSI stays flat (less than **3 dB** change over the last second), the
    jump is probably multipath, so it's held back. It's accepted once **3
-   readings in a row** agree, or immediately if RSSI also changed. Held-back
-   readings are counted.
-4. **1D Kalman filter**: smooths the remaining jitter while still following real
+   readings in a row** agree, or immediately if RSSI also changed. The manager
+   counts held-back readings (`gatedCount`); the count isn't shown on screen.
+3. **1D Kalman filter**: smooths the remaining jitter while still following real
    movement.
+
+In a simulation with 25 cm jitter and 6% multipath outliers at 10 readings per
+second, this cut the RMS error on a still board from 0.77 m to 0.09 m, and
+followed a sudden 2 m move within about 0.7 s. Real readings depend on the setup
+(see [Why readings are still noisy](#why-readings-are-still-noisy)). The window
+size and thresholds are properties at the top of `RangeFilter` if they need
+tuning.
 
 ### Calibration
 
-Every phone/board pair has a small fixed error. To remove it, place the board
-exactly **1 m** from the phone with a clear line of sight. Wait for the reading
-to settle, then choose **⋯ › Calibrate at 1 m**. The offset is saved on the
-phone and applied to every reading. **Reset Calibration** sets it back to 0.
+Every phone/board pair has a fixed error. To remove it, place the board
+exactly **1 m** from the phone with a clear line of sight, in the same setup
+(height, orientation) you'll use for measuring. Wait for the reading to settle,
+then choose **⋯ › Calibrate at 1 m**. The offset is saved on the phone, applied
+to every reading, and shown on the distance card. Calibrating also restarts the
+filter so older, uncalibrated readings don't pull the estimate. **Reset
+Calibration** sets the offset back to 0.
+
+The calibration is a single offset. If the error grows with distance (for
+example, right at 1 m but 0.5 m off at 3 m), a single offset can't fix it; check
+the setup first (see below).
 
 ### The screen
 
@@ -322,6 +358,17 @@ phone and applied to every reading. **Reset Calibration** sets it back to 0.
 3. Once it shows **Connected**, tap **Start Ranging**.
 4. Optionally calibrate at 1 m.
 
+For the most accurate readings:
+
+- Raise both devices off the table or floor, ideally 30–50 cm above any
+  surface (for example, the board on a cardboard box).
+- Keep a clear line of sight, and don't cover the phone's top edge with your
+  hand.
+- At a fixed distance, rotate the board in 90° steps and keep the orientation
+  with the closest reading and the smallest ±. Use the same orientation every
+  time.
+- Calibrate in that setup.
+
 ---
 
 ## Troubleshooting
@@ -334,7 +381,10 @@ phone and applied to every reading. **Reset Calibration** sets it back to 0.
 | `ChannelSoundingConfigurationFailed` (CBError 19) | Known iOS 27 behaviour on the first attempt right after a fresh pairing | Leave the app open, power-cycle the DK, reconnect, and start ranging again |
 | "The board connected but didn't accept Channel Sounding" | The board isn't running CS reflector firmware with RAS | Flash `firmware/` |
 | Distance is consistently off by the same amount | Fixed per-device offset | Calibrate at 1 m |
+| Distance reads too long when phone and board are at the same height on a table, but is better with the phone above the board | Reflection off the table or floor mixes with the direct path | Raise both off the surface, find the board's best orientation, then calibrate in that setup |
 | Distance jumps around | Multipath, or a hand or body between the devices | Keep a clear line of sight. The filter holds back most jumps |
+| A second iPhone can't pair or connect | Old firmware stored only one bond, or another phone is still connected (the board accepts one connection and LED0 is on while connected) | Flash the current firmware, which stores up to 4 bonds. Close the app or turn off Bluetooth on the other phone |
+| Can't launch the app: "profile has not been explicitly trusted" | Free Apple ID developer profile not trusted yet | On the iPhone, Settings › General › VPN & Device Management › trust the profile |
 | DK not detected on USB | POWER switch off, charge-only cable, or a hub | Switch it on, use a data cable, plug it straight into the computer |
 | Build fails: `File not found: .../<part of path>` | Space in the path | Build from a path without spaces |
 
