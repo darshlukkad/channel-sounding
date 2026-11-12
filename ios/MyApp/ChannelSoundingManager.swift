@@ -7,7 +7,10 @@ import UIKit
 struct RangeReading: Identifiable {
     let id = UUID()
     let date = Date()
-    let meters: Double
+    /// The calibrated reading as reported by Channel Sounding, in meters.
+    let raw: Double
+    /// The filtered estimate after this reading, in meters.
+    let filtered: Double
 }
 
 /// The connection lifecycle of the paired accessory.
@@ -35,13 +38,37 @@ enum ConnectionState: Equatable {
 @Observable
 final class ChannelSoundingManager: NSObject {
     private(set) var connectionState: ConnectionState = .idle
+    /// The filtered distance, in meters.
     private(set) var currentRange: Double?
+    /// The latest calibrated reading before filtering, in meters.
+    private(set) var rawRange: Double?
+    /// Standard deviation of recent raw readings, in meters.
+    private(set) var spread: Double?
+    /// Smoothed RSSI of the connection, in dBm.
+    private(set) var rssi: Double?
+    /// Readings held back as likely multipath errors in this session.
+    private(set) var gatedCount = 0
     private(set) var rangeReadings: [RangeReading] = []
     private(set) var sessionError: String?
     private(set) var isSessionActivated = false
 
+    /// Fixed error subtracted from every reading, in meters. Persisted across launches.
+    private(set) var calibrationOffset: Double = UserDefaults.standard.double(forKey: ChannelSoundingManager.calibrationOffsetKey) {
+        didSet { UserDefaults.standard.set(calibrationOffset, forKey: Self.calibrationOffsetKey) }
+    }
+    private static let calibrationOffsetKey = "calibrationOffset"
+
     /// Maximum number of readings kept for the chart.
     private let maxReadings = 200
+    /// Number of recent raw readings used for the spread value.
+    private let spreadWindow = 20
+    /// How often to read RSSI while ranging.
+    private let rssiInterval: Duration = .milliseconds(500)
+    /// Weight of each new RSSI sample in the smoothed value.
+    private let rssiSmoothing = 0.3
+
+    private var filter = RangeFilter()
+    private var rssiTask: Task<Void, Never>?
 
     private let accessorySession = ASAccessorySession()
     private var central: CBCentralManager?
@@ -175,12 +202,12 @@ final class ChannelSoundingManager: NSObject {
             return
         }
 
-        rangeReadings.removeAll()
-        currentRange = nil
+        resetMeasurements()
         sessionError = nil
 
         let config = CBChannelSoundingSessionConfiguration(role: .initiator)
         peripheral.startChannelSoundingSession(config)
+        startRSSIPolling(peripheral)
 
         if case .connected(let name) = connectionState {
             connectionState = .ranging(name)
@@ -189,9 +216,73 @@ final class ChannelSoundingManager: NSObject {
 
     func stopChannelSounding() {
         connectedPeripheral?.cancelChannelSoundingSession()
+        stopRSSIPolling()
         if case .ranging(let name) = connectionState {
             connectionState = .connected(name)
         }
+    }
+
+    // MARK: - Measurements
+
+    private func resetMeasurements() {
+        filter.reset()
+        rangeReadings.removeAll()
+        currentRange = nil
+        rawRange = nil
+        spread = nil
+        gatedCount = 0
+    }
+
+    private func handleDistance(_ reportedMeters: Double) {
+        let raw = reportedMeters - calibrationOffset
+        let output = filter.update(raw, rssi: rssi)
+        if output.rejected { gatedCount += 1 }
+
+        rawRange = raw
+        currentRange = output.estimate
+        rangeReadings.append(RangeReading(raw: raw, filtered: output.estimate))
+        if rangeReadings.count > maxReadings {
+            rangeReadings.removeFirst(rangeReadings.count - maxReadings)
+        }
+        let recent = rangeReadings.suffix(spreadWindow).map(\.raw)
+        spread = recent.count >= 5 ? RangeFilter.standardDeviation(of: recent) : nil
+    }
+
+    // MARK: - Calibration
+
+    /// Sets the offset so the current filtered distance reads as `knownDistance`.
+    /// Place the board exactly that far from the phone, let it settle, then call this.
+    func calibrate(atKnownDistance knownDistance: Double = 1.0) {
+        guard let currentRange else { return }
+        calibrationOffset += currentRange - knownDistance
+        // Restart the filter so old, uncalibrated readings don't pull the estimate.
+        resetMeasurements()
+    }
+
+    func resetCalibration() {
+        calibrationOffset = 0
+        resetMeasurements()
+    }
+
+    // MARK: - RSSI
+
+    /// Reads RSSI periodically while ranging; the filter uses it to tell real
+    /// movement from multipath jumps.
+    private func startRSSIPolling(_ peripheral: CBPeripheral) {
+        stopRSSIPolling()
+        rssi = nil
+        rssiTask = Task { [weak self, rssiInterval] in
+            while !Task.isCancelled {
+                peripheral.readRSSI()
+                try? await Task.sleep(for: rssiInterval)
+                if self == nil { return }
+            }
+        }
+    }
+
+    private func stopRSSIPolling() {
+        rssiTask?.cancel()
+        rssiTask = nil
     }
 }
 
@@ -247,8 +338,10 @@ extension ChannelSoundingManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
+        stopRSSIPolling()
         connectedPeripheral = nil
         currentRange = nil
+        rawRange = nil
         connectionState = .idle
         if let error { sessionError = error.localizedDescription }
     }
@@ -266,15 +359,19 @@ extension ChannelSoundingManager: CBPeripheralDelegate {
         }
         // The API reports a negative sentinel when no valid measurement is available.
         guard let distance = results?.distance, distance > 0 else { return }
-        currentRange = distance
-        rangeReadings.append(RangeReading(meters: distance))
-        if rangeReadings.count > maxReadings {
-            rangeReadings.removeFirst(rangeReadings.count - maxReadings)
-        }
+        handleDistance(distance)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+        // 127 means the controller couldn't measure RSSI.
+        guard error == nil, RSSI.intValue != 127 else { return }
+        let sample = RSSI.doubleValue
+        rssi = rssi.map { $0 + rssiSmoothing * (sample - $0) } ?? sample
     }
 
     func peripheral(_ peripheral: CBPeripheral,
                     didCompleteChannelSoundingSession error: Error?) {
+        stopRSSIPolling()
         if case .ranging(let name) = connectionState {
             connectionState = .connected(name)
         }
